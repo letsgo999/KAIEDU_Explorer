@@ -1,0 +1,720 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+namespace DualDriveExplorer
+{
+    public static class Program
+    {
+        [STAThread]
+        public static void Main(string[] args)
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            if (args.Length >= 2 && string.Equals(args[0], "--copy-url", StringComparison.OrdinalIgnoreCase))
+            {
+                UrlCommand.Run(args[1]);
+                return;
+            }
+
+            if (args.Length >= 1 && string.Equals(args[0], "--connect-google", StringComparison.OrdinalIgnoreCase))
+            {
+                GoogleAuth.ConnectInteractive(args.Length >= 2 ? args[1] : null);
+                return;
+            }
+
+            if (args.Length >= 2 && string.Equals(args[0], "--diagnostics", StringComparison.OrdinalIgnoreCase))
+            {
+                Diagnostics.Write(args[1]);
+                return;
+            }
+
+            bool created;
+            using (var mutex = new Mutex(true, "Local\\DualDriveExplorer.Controller", out created))
+            {
+                if (!created)
+                {
+                    return;
+                }
+                Application.Run(new TrayContext());
+            }
+        }
+    }
+
+    internal sealed class AppSettings
+    {
+        public string LeftPath { get; set; }
+        public string RightPath { get; set; }
+        public string ClientIdProtected { get; set; }
+        public string ClientSecretProtected { get; set; }
+        public string TokenProtected { get; set; }
+
+        public AppSettings()
+        {
+            LeftPath = @"G:\";
+            RightPath = @"C:\";
+        }
+    }
+
+    internal static class SettingsStore
+    {
+        internal static readonly string DirectoryPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DualDriveExplorer");
+        internal static readonly string SettingsPath = Path.Combine(DirectoryPath, "settings.json");
+        private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+
+        internal static AppSettings Load()
+        {
+            try
+            {
+                if (File.Exists(SettingsPath))
+                {
+                    var value = Json.Deserialize<AppSettings>(File.ReadAllText(SettingsPath, Encoding.UTF8));
+                    if (value != null)
+                    {
+                        if (string.IsNullOrWhiteSpace(value.LeftPath)) value.LeftPath = @"G:\";
+                        if (string.IsNullOrWhiteSpace(value.RightPath)) value.RightPath = @"C:\";
+                        return value;
+                    }
+                }
+            }
+            catch { }
+            return new AppSettings();
+        }
+
+        internal static void Save(AppSettings value)
+        {
+            Directory.CreateDirectory(DirectoryPath);
+            string temp = SettingsPath + ".tmp";
+            File.WriteAllText(temp, Json.Serialize(value), new UTF8Encoding(false));
+            if (File.Exists(SettingsPath))
+            {
+                File.Delete(SettingsPath);
+            }
+            File.Move(temp, SettingsPath);
+        }
+
+        internal static string Protect(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return null;
+            byte[] raw = Encoding.UTF8.GetBytes(value);
+            byte[] protectedBytes = ProtectedData.Protect(raw, null, DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(protectedBytes);
+        }
+
+        internal static string Unprotect(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return null;
+            try
+            {
+                byte[] protectedBytes = Convert.FromBase64String(value);
+                return Encoding.UTF8.GetString(ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser));
+            }
+            catch { return null; }
+        }
+    }
+
+    internal sealed class TrayContext : ApplicationContext
+    {
+        private readonly NotifyIcon tray;
+        private readonly ExplorerPair explorerPair;
+
+        internal TrayContext()
+        {
+            explorerPair = new ExplorerPair(SettingsStore.Load());
+            var menu = new ContextMenuStrip();
+            menu.Items.Add(MenuItem("Open / arrange explorers", delegate { explorerPair.OpenAndArrange(); }));
+            menu.Items.Add(MenuItem("Save current paths", delegate { explorerPair.CaptureAndSave(); ShowBalloon("Paths saved."); }));
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(MenuItem("Connect Google account...", delegate { GoogleAuth.ConnectInteractive(); }));
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(MenuItem("Exit", delegate { ExitApp(); }));
+
+            tray = new NotifyIcon();
+            tray.Icon = SystemIcons.Application;
+            tray.Text = "Dual Drive Explorer";
+            tray.Visible = true;
+            tray.ContextMenuStrip = menu;
+            tray.DoubleClick += delegate { explorerPair.OpenAndArrange(); };
+
+            explorerPair.StartTracking();
+            Application.Idle += FirstIdle;
+        }
+
+        private ToolStripMenuItem MenuItem(string text, EventHandler action)
+        {
+            var item = new ToolStripMenuItem(text);
+            item.Click += action;
+            return item;
+        }
+
+        private void FirstIdle(object sender, EventArgs e)
+        {
+            Application.Idle -= FirstIdle;
+            explorerPair.OpenAndArrange();
+        }
+
+        private void ShowBalloon(string message)
+        {
+            tray.BalloonTipTitle = "Dual Drive Explorer";
+            tray.BalloonTipText = message;
+            tray.ShowBalloonTip(2000);
+        }
+
+        private void ExitApp()
+        {
+            explorerPair.CaptureAndSave();
+            explorerPair.Dispose();
+            tray.Visible = false;
+            tray.Dispose();
+            ExitThread();
+        }
+    }
+
+    internal sealed class ExplorerPair : IDisposable
+    {
+        private readonly AppSettings settings;
+        private readonly System.Windows.Forms.Timer timer;
+        private IntPtr leftHandle;
+        private IntPtr rightHandle;
+        private int arrangeRetries;
+
+        internal ExplorerPair(AppSettings value)
+        {
+            settings = value;
+            timer = new System.Windows.Forms.Timer();
+            timer.Interval = 2000;
+            timer.Tick += delegate
+            {
+                if (arrangeRetries > 0)
+                {
+                    Arrange();
+                    arrangeRetries--;
+                }
+                CaptureAndSave();
+            };
+        }
+
+        internal void StartTracking() { timer.Start(); }
+
+        internal void OpenAndArrange()
+        {
+            string left = ExistingOrDefault(settings.LeftPath, @"G:\");
+            string right = ExistingOrDefault(settings.RightPath, @"C:\");
+            leftHandle = OpenExplorerWindow(left, IntPtr.Zero);
+            rightHandle = OpenExplorerWindow(right, leftHandle);
+            arrangeRetries = 5;
+            Arrange();
+            CaptureAndSave();
+        }
+
+        private static string ExistingOrDefault(string requested, string fallback)
+        {
+            try { if (Directory.Exists(requested)) return requested; } catch { }
+            return Directory.Exists(fallback) ? fallback : @"C:\";
+        }
+
+        private IntPtr OpenExplorerWindow(string path, IntPtr excluded)
+        {
+            var before = new HashSet<long>(GetExplorerWindows().Select(x => x.Handle.ToInt64()));
+            var info = new ProcessStartInfo("explorer.exe", "/n,\"" + path + "\"");
+            info.UseShellExecute = true;
+            Process.Start(info);
+
+            DateTime deadline = DateTime.UtcNow.AddSeconds(8);
+            while (DateTime.UtcNow < deadline)
+            {
+                Application.DoEvents();
+                Thread.Sleep(200);
+                var windows = GetExplorerWindows();
+                var created = windows.LastOrDefault(x => !before.Contains(x.Handle.ToInt64()) && x.Handle != excluded);
+                if (created != null) return created.Handle;
+            }
+            var fallback = GetExplorerWindows().LastOrDefault(x => x.Handle != excluded && PathsEqual(x.Path, path));
+            if (fallback != null) return fallback.Handle;
+            return IntPtr.Zero;
+        }
+
+        private void Arrange()
+        {
+            Rectangle area = Screen.PrimaryScreen.WorkingArea;
+            int half = area.Width / 2;
+            if (leftHandle != IntPtr.Zero)
+            {
+                Native.ShowWindow(leftHandle, Native.SW_RESTORE);
+                Native.SetWindowPos(leftHandle, IntPtr.Zero, area.Left, area.Top, half, area.Height, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+            }
+            if (rightHandle != IntPtr.Zero)
+            {
+                Native.ShowWindow(rightHandle, Native.SW_RESTORE);
+                Native.SetWindowPos(rightHandle, IntPtr.Zero, area.Left + half, area.Top, area.Width - half, area.Height, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+            }
+        }
+
+        internal void CaptureAndSave()
+        {
+            bool changed = false;
+            var windows = GetExplorerWindows();
+            var left = windows.FirstOrDefault(x => x.Handle == leftHandle);
+            var right = windows.FirstOrDefault(x => x.Handle == rightHandle);
+            if (left != null && Directory.Exists(left.Path) && !PathsEqual(left.Path, settings.LeftPath))
+            {
+                settings.LeftPath = left.Path;
+                changed = true;
+            }
+            if (right != null && Directory.Exists(right.Path) && !PathsEqual(right.Path, settings.RightPath))
+            {
+                settings.RightPath = right.Path;
+                changed = true;
+            }
+            if (changed) SettingsStore.Save(settings);
+        }
+
+        private static bool PathsEqual(string a, string b)
+        {
+            if (a == null || b == null) return false;
+            return string.Equals(a.TrimEnd('\\'), b.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<ExplorerWindow> GetExplorerWindows()
+        {
+            var result = new List<ExplorerWindow>();
+            object shell = null;
+            object windows = null;
+            try
+            {
+                Type type = Type.GetTypeFromProgID("Shell.Application");
+                shell = Activator.CreateInstance(type);
+                windows = type.InvokeMember("Windows", System.Reflection.BindingFlags.InvokeMethod, null, shell, null);
+                int count = (int)windows.GetType().InvokeMember("Count", System.Reflection.BindingFlags.GetProperty, null, windows, null);
+                for (int i = 0; i < count; i++)
+                {
+                    object window = windows.GetType().InvokeMember("Item", System.Reflection.BindingFlags.InvokeMethod, null, windows, new object[] { i });
+                    if (window == null) continue;
+                    try
+                    {
+                        string fullName = Convert.ToString(window.GetType().InvokeMember("FullName", System.Reflection.BindingFlags.GetProperty, null, window, null));
+                        if (!fullName.EndsWith("explorer.exe", StringComparison.OrdinalIgnoreCase)) continue;
+                        int hwnd = Convert.ToInt32(window.GetType().InvokeMember("HWND", System.Reflection.BindingFlags.GetProperty, null, window, null));
+                        string url = Convert.ToString(window.GetType().InvokeMember("LocationURL", System.Reflection.BindingFlags.GetProperty, null, window, null));
+                        string path = UrlToPath(url);
+                        if (!string.IsNullOrEmpty(path)) result.Add(new ExplorerWindow(new IntPtr(hwnd), path));
+                    }
+                    catch { }
+                    finally { if (window != null && Marshal.IsComObject(window)) Marshal.FinalReleaseComObject(window); }
+                }
+            }
+            catch { }
+            finally
+            {
+                if (windows != null && Marshal.IsComObject(windows)) Marshal.FinalReleaseComObject(windows);
+                if (shell != null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
+            }
+            return result;
+        }
+
+        private static string UrlToPath(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return null;
+            try
+            {
+                var uri = new Uri(url);
+                if (uri.IsFile) return Uri.UnescapeDataString(uri.LocalPath);
+            }
+            catch { }
+            return null;
+        }
+
+        public void Dispose() { timer.Stop(); timer.Dispose(); }
+    }
+
+    internal sealed class ExplorerWindow
+    {
+        internal IntPtr Handle { get; private set; }
+        internal string Path { get; private set; }
+        internal ExplorerWindow(IntPtr handle, string path) { Handle = handle; Path = path; }
+    }
+
+    internal static class Native
+    {
+        internal const uint SWP_NOZORDER = 0x0004;
+        internal const uint SWP_SHOWWINDOW = 0x0040;
+        internal const int SW_RESTORE = 9;
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")]
+        internal static extern bool ShowWindow(IntPtr hWnd, int command);
+    }
+
+    internal sealed class OAuthToken
+    {
+        public string access_token { get; set; }
+        public string refresh_token { get; set; }
+        public int expires_in { get; set; }
+        public string token_type { get; set; }
+        public string scope { get; set; }
+        public long expires_at_utc { get; set; }
+    }
+
+    internal static class GoogleAuth
+    {
+        private const string Scope = "https://www.googleapis.com/auth/drive.metadata.readonly";
+        private const string AuthEndpoint = "https://accounts.google.com/o/oauth2/v2/auth";
+        private const string TokenEndpoint = "https://oauth2.googleapis.com/token";
+        private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+
+        internal static bool IsConfigured(AppSettings settings)
+        {
+            return !string.IsNullOrEmpty(SettingsStore.Unprotect(settings.ClientIdProtected));
+        }
+
+        internal static void ConnectInteractive(string credentialPath = null)
+        {
+            try
+            {
+                string selectedPath = credentialPath;
+                if (string.IsNullOrWhiteSpace(selectedPath))
+                {
+                    using (var dialog = new OpenFileDialog())
+                    {
+                        dialog.Title = "Select Google OAuth desktop client JSON";
+                        dialog.Filter = "Google OAuth JSON (*.json)|*.json|All files (*.*)|*.*";
+                        if (dialog.ShowDialog() != DialogResult.OK) return;
+                        selectedPath = dialog.FileName;
+                    }
+                }
+
+                var root = Json.DeserializeObject(File.ReadAllText(selectedPath, Encoding.UTF8)) as Dictionary<string, object>;
+                Dictionary<string, object> installed = null;
+                if (root != null && root.ContainsKey("installed")) installed = root["installed"] as Dictionary<string, object>;
+                if (installed == null || !installed.ContainsKey("client_id"))
+                    throw new InvalidOperationException("This is not a Google OAuth Desktop app credential JSON file.");
+
+                string clientId = Convert.ToString(installed["client_id"]);
+                string clientSecret = installed.ContainsKey("client_secret") ? Convert.ToString(installed["client_secret"]) : "";
+                OAuthToken token = Authorize(clientId, clientSecret);
+                var settings = SettingsStore.Load();
+                settings.ClientIdProtected = SettingsStore.Protect(clientId);
+                settings.ClientSecretProtected = SettingsStore.Protect(clientSecret);
+                settings.TokenProtected = SettingsStore.Protect(Json.Serialize(token));
+                SettingsStore.Save(settings);
+                string errorLog = Path.Combine(SettingsStore.DirectoryPath, "oauth-error.log");
+                if (File.Exists(errorLog)) File.Delete(errorLog);
+                MessageBox.Show("Google Drive metadata access is connected.", "Dual Drive Explorer", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                Directory.CreateDirectory(SettingsStore.DirectoryPath);
+                File.WriteAllText(Path.Combine(SettingsStore.DirectoryPath, "oauth-error.log"), ex.ToString(), new UTF8Encoding(false));
+                MessageBox.Show("Google connection failed.\r\n\r\n" + ex.Message, "Dual Drive Explorer", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private static OAuthToken Authorize(string clientId, string clientSecret)
+        {
+            int port;
+            var probe = new TcpListener(IPAddress.Loopback, 0);
+            probe.Start();
+            port = ((IPEndPoint)probe.LocalEndpoint).Port;
+            probe.Stop();
+            string redirect = "http://127.0.0.1:" + port + "/";
+            string verifier = Base64Url(RandomBytes(48));
+            string challenge;
+            using (var sha = SHA256.Create()) challenge = Base64Url(sha.ComputeHash(Encoding.ASCII.GetBytes(verifier)));
+            string state = Base64Url(RandomBytes(24));
+
+            string url = AuthEndpoint +
+                "?client_id=" + Uri.EscapeDataString(clientId) +
+                "&redirect_uri=" + Uri.EscapeDataString(redirect) +
+                "&response_type=code" +
+                "&scope=" + Uri.EscapeDataString(Scope) +
+                "&access_type=offline&prompt=consent" +
+                "&code_challenge=" + Uri.EscapeDataString(challenge) +
+                "&code_challenge_method=S256" +
+                "&state=" + Uri.EscapeDataString(state);
+
+            var listener = new HttpListener();
+            listener.Prefixes.Add(redirect);
+            listener.Start();
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            var context = listener.GetContext();
+            string returnedState = context.Request.QueryString["state"];
+            string code = context.Request.QueryString["code"];
+            string error = context.Request.QueryString["error"];
+            byte[] response = Encoding.UTF8.GetBytes("<html><body><h2>Dual Drive Explorer</h2><p>You can close this window.</p></body></html>");
+            context.Response.ContentType = "text/html; charset=utf-8";
+            context.Response.OutputStream.Write(response, 0, response.Length);
+            context.Response.Close();
+            listener.Stop();
+            if (!string.IsNullOrEmpty(error)) throw new InvalidOperationException("Google returned: " + error);
+            if (returnedState != state || string.IsNullOrEmpty(code)) throw new InvalidOperationException("OAuth response validation failed.");
+
+            var form = new Dictionary<string, string>();
+            form["client_id"] = clientId;
+            if (!string.IsNullOrEmpty(clientSecret)) form["client_secret"] = clientSecret;
+            form["code"] = code;
+            form["code_verifier"] = verifier;
+            form["redirect_uri"] = redirect;
+            form["grant_type"] = "authorization_code";
+            using (var client = new HttpClient())
+            {
+                var httpResponse = client.PostAsync(TokenEndpoint, new FormUrlEncodedContent(form)).Result;
+                string json = httpResponse.Content.ReadAsStringAsync().Result;
+                if (!httpResponse.IsSuccessStatusCode) throw new InvalidOperationException("Token exchange failed: " + json);
+                var token = Json.Deserialize<OAuthToken>(json);
+                token.expires_at_utc = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + Math.Max(60, token.expires_in - 120);
+                return token;
+            }
+        }
+
+        internal static string GetAccessToken(AppSettings settings)
+        {
+            string tokenJson = SettingsStore.Unprotect(settings.TokenProtected);
+            string clientId = SettingsStore.Unprotect(settings.ClientIdProtected);
+            string clientSecret = SettingsStore.Unprotect(settings.ClientSecretProtected) ?? "";
+            if (string.IsNullOrEmpty(tokenJson) || string.IsNullOrEmpty(clientId)) return null;
+            var token = Json.Deserialize<OAuthToken>(tokenJson);
+            if (token != null && !string.IsNullOrEmpty(token.access_token) && token.expires_at_utc > DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                return token.access_token;
+            if (token == null || string.IsNullOrEmpty(token.refresh_token)) return null;
+
+            var form = new Dictionary<string, string>();
+            form["client_id"] = clientId;
+            if (!string.IsNullOrEmpty(clientSecret)) form["client_secret"] = clientSecret;
+            form["refresh_token"] = token.refresh_token;
+            form["grant_type"] = "refresh_token";
+            using (var client = new HttpClient())
+            {
+                var response = client.PostAsync(TokenEndpoint, new FormUrlEncodedContent(form)).Result;
+                string json = response.Content.ReadAsStringAsync().Result;
+                if (!response.IsSuccessStatusCode) return null;
+                var refreshed = Json.Deserialize<OAuthToken>(json);
+                refreshed.refresh_token = token.refresh_token;
+                refreshed.expires_at_utc = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + Math.Max(60, refreshed.expires_in - 120);
+                settings.TokenProtected = SettingsStore.Protect(Json.Serialize(refreshed));
+                SettingsStore.Save(settings);
+                return refreshed.access_token;
+            }
+        }
+
+        private static byte[] RandomBytes(int count) { var b = new byte[count]; using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(b); return b; }
+        private static string Base64Url(byte[] value) { return Convert.ToBase64String(value).TrimEnd('=').Replace('+', '-').Replace('/', '_'); }
+    }
+
+    internal sealed class DriveItem
+    {
+        public string id { get; set; }
+        public string name { get; set; }
+        public string mimeType { get; set; }
+        public string webViewLink { get; set; }
+        public string size { get; set; }
+        public string md5Checksum { get; set; }
+        public string modifiedTime { get; set; }
+    }
+
+    internal sealed class DriveList
+    {
+        public DriveItem[] files { get; set; }
+    }
+
+    internal static class DriveResolver
+    {
+        private const string FolderMime = "application/vnd.google-apps.folder";
+        private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+
+        internal static DriveItem Resolve(string localPath, string accessToken)
+        {
+            string full = Path.GetFullPath(localPath).TrimEnd('\\');
+            string root = Path.GetPathRoot(full);
+            if (!string.Equals(root, @"G:\", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("The selected item is not inside the Google Drive G: volume.");
+
+            string relative = full.Substring(root.Length).Trim('\\');
+            if (relative.Length == 0)
+                return new DriveItem { id = "root", name = "Google Drive", mimeType = FolderMime, webViewLink = "https://drive.google.com/drive/my-drive" };
+
+            string[] parts = relative.Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            int index = 0;
+            string parent = "root";
+            string driveId = null;
+            if (parts.Length > 0 && IsMyDriveLabel(parts[0]))
+            {
+                index = 1;
+            }
+            else if (parts.Length > 0 && IsSharedDriveLabel(parts[0]))
+            {
+                if (parts.Length < 2) throw new InvalidOperationException("Select a folder or file inside a shared drive.");
+                driveId = FindSharedDrive(parts[1], accessToken);
+                parent = driveId;
+                index = 2;
+            }
+            else
+            {
+                throw new InvalidOperationException("Only My Drive and Shared drives under G: are supported.");
+            }
+
+            DriveItem current = null;
+            for (int i = index; i < parts.Length; i++)
+            {
+                bool final = i == parts.Length - 1;
+                var names = CandidateNames(parts[i]);
+                var candidates = new List<DriveItem>();
+                foreach (string name in names)
+                {
+                    candidates.AddRange(FindChildren(parent, name, driveId, accessToken));
+                }
+                if (!final) candidates = candidates.Where(x => x.mimeType == FolderMime).ToList();
+                if (candidates.Count == 0) return null;
+                if (candidates.Count > 1 && final && File.Exists(full))
+                {
+                    long length = new FileInfo(full).Length;
+                    var sizeMatch = candidates.Where(x => x.size == length.ToString()).ToList();
+                    if (sizeMatch.Count == 1) candidates = sizeMatch;
+                }
+                if (candidates.Count != 1)
+                    throw new InvalidOperationException("More than one cloud item matches this path. The URL was not copied to avoid selecting the wrong file.");
+                current = candidates[0];
+                parent = current.id;
+            }
+            return current;
+        }
+
+        private static IEnumerable<string> CandidateNames(string localName)
+        {
+            yield return localName;
+            string lower = localName.ToLowerInvariant();
+            foreach (string ext in new[] { ".gdoc", ".gsheet", ".gslides", ".gdraw", ".gform" })
+                if (lower.EndsWith(ext)) yield return localName.Substring(0, localName.Length - ext.Length);
+        }
+
+        private static List<DriveItem> FindChildren(string parent, string name, string driveId, string token)
+        {
+            string query = "'" + EscapeQuery(parent) + "' in parents and name = '" + EscapeQuery(name) + "' and trashed = false";
+            var args = new List<string>();
+            args.Add("q=" + Uri.EscapeDataString(query));
+            args.Add("fields=" + Uri.EscapeDataString("files(id,name,mimeType,webViewLink,size,md5Checksum,modifiedTime)"));
+            args.Add("pageSize=100");
+            args.Add("supportsAllDrives=true");
+            args.Add("includeItemsFromAllDrives=true");
+            if (!string.IsNullOrEmpty(driveId))
+            {
+                args.Add("corpora=drive");
+                args.Add("driveId=" + Uri.EscapeDataString(driveId));
+            }
+            string json = GetJson("https://www.googleapis.com/drive/v3/files?" + string.Join("&", args), token);
+            var list = Json.Deserialize<DriveList>(json);
+            return list != null && list.files != null ? list.files.ToList() : new List<DriveItem>();
+        }
+
+        private static string FindSharedDrive(string name, string token)
+        {
+            string json = GetJson("https://www.googleapis.com/drive/v3/drives?pageSize=100&fields=" + Uri.EscapeDataString("drives(id,name)"), token);
+            var root = Json.DeserializeObject(json) as Dictionary<string, object>;
+            var drives = root != null && root.ContainsKey("drives") ? root["drives"] as IEnumerable : null;
+            var matches = new List<string>();
+            if (drives != null)
+            {
+                foreach (object value in drives)
+                {
+                    var d = value as Dictionary<string, object>;
+                    if (d != null && string.Equals(Convert.ToString(d["name"]), name, StringComparison.OrdinalIgnoreCase))
+                        matches.Add(Convert.ToString(d["id"]));
+                }
+            }
+            if (matches.Count != 1) throw new InvalidOperationException("The shared drive name could not be resolved uniquely.");
+            return matches[0];
+        }
+
+        private static string GetJson(string url, string token)
+        {
+            using (var client = new HttpClient())
+            {
+                client.Timeout = TimeSpan.FromSeconds(20);
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                var response = client.GetAsync(url).Result;
+                string json = response.Content.ReadAsStringAsync().Result;
+                if (!response.IsSuccessStatusCode) throw new InvalidOperationException("Google Drive API returned " + (int)response.StatusCode + ".");
+                return json;
+            }
+        }
+
+        private static string EscapeQuery(string value) { return value.Replace("\\", "\\\\").Replace("'", "\\'"); }
+        private static bool IsMyDriveLabel(string value) { return value == "\uB0B4 \uB4DC\uB77C\uC774\uBE0C" || value.Equals("My Drive", StringComparison.OrdinalIgnoreCase); }
+        private static bool IsSharedDriveLabel(string value) { return value == "\uACF5\uC720 \uB4DC\uB77C\uC774\uBE0C" || value.Equals("Shared drives", StringComparison.OrdinalIgnoreCase); }
+    }
+
+    internal static class UrlCommand
+    {
+        internal static void Run(string path)
+        {
+            try
+            {
+                if (!File.Exists(path) && !Directory.Exists(path))
+                    throw new FileNotFoundException("The selected item no longer exists.");
+                var settings = SettingsStore.Load();
+                if (!GoogleAuth.IsConfigured(settings))
+                    throw new InvalidOperationException("Google OAuth is not connected. Open Dual Drive Explorer from the tray and choose 'Connect Google account...'.");
+                string token = GoogleAuth.GetAccessToken(settings);
+                if (string.IsNullOrEmpty(token))
+                    throw new InvalidOperationException("Google authorization expired. Reconnect the Google account from the tray menu.");
+
+                DriveItem item = null;
+                for (int attempt = 0; attempt < 6 && item == null; attempt++)
+                {
+                    item = DriveResolver.Resolve(path, token);
+                    if (item == null) Thread.Sleep(2000);
+                }
+                if (item == null || string.IsNullOrEmpty(item.webViewLink))
+                    throw new InvalidOperationException("The item is not available in Google Drive yet. It may still be syncing.");
+
+                Clipboard.SetText(item.webViewLink);
+                MessageBox.Show("Google Drive URL copied to the clipboard.", "Dual Drive Explorer", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message, "Copy Google Cloud URL", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+    }
+
+    internal static class Diagnostics
+    {
+        internal static void Write(string outputPath)
+        {
+            try
+            {
+                var settings = SettingsStore.Load();
+                var data = new Dictionary<string, object>();
+                data["settingsPath"] = SettingsStore.SettingsPath;
+                data["leftPath"] = settings.LeftPath;
+                data["rightPath"] = settings.RightPath;
+                data["googleConfigured"] = GoogleAuth.IsConfigured(settings);
+                data["gDriveReady"] = Directory.Exists(@"G:\");
+                data["contextFile"] = Registry.CurrentUser.OpenSubKey(@"Software\Classes\*\shell\DualDriveExplorer.CopyGoogleUrl") != null;
+                data["contextFolder"] = Registry.CurrentUser.OpenSubKey(@"Software\Classes\Directory\shell\DualDriveExplorer.CopyGoogleUrl") != null;
+                File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(data), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                File.WriteAllText(outputPath, "{\"error\":\"" + ex.Message.Replace("\"", "'") + "\"}");
+            }
+        }
+    }
+}

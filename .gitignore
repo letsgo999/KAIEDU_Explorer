@@ -1,0 +1,18 @@
+# OAuth credentials and tokens
+client_secret*.json
+*oauth*.json
+settings.json
+oauth-error.log
+
+# Build and local artifacts
+*.exe
+*.dll
+*.pdb
+*.zip
+bin/
+obj/
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
