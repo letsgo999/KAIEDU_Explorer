@@ -46,7 +46,7 @@ KAIEDU_Explorer/
 
 ## 개인정보 및 보안
 
-앱은 선택한 Google Drive 파일·폴더의 이름, 상위 폴더 관계, 식별자와 `webViewLink`만 읽습니다. 파일 본문은 읽거나 전송하지 않습니다. 자세한 내용은 [개인정보처리방침](https://kaiedu.center/download/privacy.html)을 확인하세요.
+앱은 선택한 Google Drive 파일·폴더의 이름, 상위 폴더 관계, 식별자와 `webViewLink`만 읽습니다. 파일 본문은 읽거나 전송하지 않습니다. 자세한 내용은 [개인정보처리방침](https://kaiedu.center/download/privacy)을 확인하세요.
 
 ## 개발 환경
 
