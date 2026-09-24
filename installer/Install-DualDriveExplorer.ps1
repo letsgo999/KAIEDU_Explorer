@@ -53,9 +53,16 @@ $shortcut.WorkingDirectory = $installDir
 $shortcut.Description = 'Open and remember two Explorer windows for Google Drive and local files.'
 $shortcut.Save()
 
+$explorerModeResult = Join-Path $installDir 'explorer-browse-mode.json'
+& $powerShellExe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $installScript --configure-explorer $explorerModeResult
+if ($LASTEXITCODE -ne 0) {
+    throw "Windows Explorer same-window browsing could not be configured. See: $explorerModeResult"
+}
+
 Start-Process -FilePath $powerShellExe -ArgumentList @(
     '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $installScript + '"')
 )
 Write-Output "Installed: $installScript"
 Write-Output "Context menu: $menuText"
 Write-Output "Startup shortcut: $shortcutPath"
+Write-Output "Explorer browse mode: folders open in the same window"

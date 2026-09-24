@@ -51,6 +51,12 @@ namespace DualDriveExplorer
                 return;
             }
 
+            if (args.Length >= 2 && string.Equals(args[0], "--configure-explorer", StringComparison.OrdinalIgnoreCase))
+            {
+                ExplorerBrowseMode.Configure(args[1]);
+                return;
+            }
+
             if (args.Length >= 3 && string.Equals(args[0], "--resolve-url", StringComparison.OrdinalIgnoreCase))
             {
                 UrlCommand.WriteResolvedUrl(args[1], args[2]);
@@ -150,6 +156,89 @@ namespace DualDriveExplorer
         }
     }
 
+    internal static class ExplorerBrowseMode
+    {
+        private const string CabinetStateKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState";
+        private const string SettingsValue = "Settings";
+        private const uint NewWindowModeFlag = 0x20;
+        private const int WmSettingChange = 0x001A;
+        private static readonly IntPtr BroadcastHandle = new IntPtr(0xffff);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr SendMessageTimeout(
+            IntPtr window, uint message, UIntPtr wParam, string lParam,
+            uint flags, uint timeout, out UIntPtr result);
+
+        internal static bool IsNewWindowMode(byte[] data)
+        {
+            return data != null && data.Length >= 8 &&
+                (BitConverter.ToUInt32(data, 4) & NewWindowModeFlag) != 0;
+        }
+
+        internal static byte[] WithSameWindowMode(byte[] data)
+        {
+            if (data == null || data.Length < 8)
+                throw new InvalidDataException("Windows Explorer CabinetState data is missing or invalid.");
+
+            byte[] changed = (byte[])data.Clone();
+            uint flags = BitConverter.ToUInt32(changed, 4) & ~NewWindowModeFlag;
+            byte[] flagBytes = BitConverter.GetBytes(flags);
+            Buffer.BlockCopy(flagBytes, 0, changed, 4, flagBytes.Length);
+            return changed;
+        }
+
+        internal static void Configure(string outputPath)
+        {
+            var result = new Dictionary<string, object>();
+            try
+            {
+                Directory.CreateDirectory(SettingsStore.DirectoryPath);
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(CabinetStateKey))
+                {
+                    byte[] original = key.GetValue(SettingsValue) as byte[];
+                    if (original == null || original.Length < 8)
+                    {
+                        result["changed"] = false;
+                        result["newWindowModeBefore"] = false;
+                        result["newWindowModeAfter"] = false;
+                        result["backupPath"] = null;
+                        result["usedWindowsDefault"] = true;
+                        File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(result), new UTF8Encoding(false));
+                        return;
+                    }
+
+                    bool before = IsNewWindowMode(original);
+                    string backupPath = Path.Combine(SettingsStore.DirectoryPath,
+                        "explorer-cabinetstate-before-kaiedu.bin");
+                    if (before && !File.Exists(backupPath))
+                        File.WriteAllBytes(backupPath, original);
+
+                    byte[] updated = WithSameWindowMode(original);
+                    if (before)
+                        key.SetValue(SettingsValue, updated, RegistryValueKind.Binary);
+
+                    UIntPtr ignored;
+                    SendMessageTimeout(BroadcastHandle, WmSettingChange, UIntPtr.Zero,
+                        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+                        0x0002, 2000, out ignored);
+
+                    result["changed"] = before;
+                    result["newWindowModeBefore"] = before;
+                    result["newWindowModeAfter"] = IsNewWindowMode(
+                        key.GetValue(SettingsValue) as byte[]);
+                    result["backupPath"] = before || File.Exists(backupPath) ? backupPath : null;
+                }
+                File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(result), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                result["error"] = ex.Message;
+                File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(result), new UTF8Encoding(false));
+                Environment.ExitCode = 1;
+            }
+        }
+    }
+
     internal sealed class TrayContext : ApplicationContext
     {
         private readonly NotifyIcon tray;
@@ -221,6 +310,10 @@ namespace DualDriveExplorer
         private readonly SplitterOverlay splitter;
         private IntPtr leftHandle;
         private IntPtr rightHandle;
+        private Native.WinEventDelegate locationChangeCallback;
+        private IntPtr locationChangeHook;
+        private bool synchronizingWindows;
+        private bool ratioDirty;
         private int arrangeRetries;
         private int saveTick;
 
@@ -239,6 +332,11 @@ namespace DualDriveExplorer
                     arrangeRetries--;
                 }
                 UpdateSplitter();
+                if (ratioDirty)
+                {
+                    ratioDirty = false;
+                    SettingsStore.Save(settings);
+                }
                 saveTick++;
                 if (saveTick >= 4)
                 {
@@ -248,7 +346,19 @@ namespace DualDriveExplorer
             };
         }
 
-        internal void StartTracking() { timer.Start(); }
+        internal void StartTracking()
+        {
+            locationChangeCallback = OnWindowLocationChanged;
+            locationChangeHook = Native.SetWinEventHook(
+                Native.EVENT_OBJECT_LOCATIONCHANGE,
+                Native.EVENT_OBJECT_LOCATIONCHANGE,
+                IntPtr.Zero,
+                locationChangeCallback,
+                0,
+                0,
+                Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
+            timer.Start();
+        }
 
         internal void OpenAndArrange()
         {
@@ -376,6 +486,37 @@ namespace DualDriveExplorer
             Rectangle area = Screen.PrimaryScreen.WorkingArea;
             settings.SplitRatio = SplitterLayout.ClampRatio((double)(screenX - area.Left) / Math.Max(1, area.Width));
             Arrange();
+        }
+
+        private void OnWindowLocationChanged(IntPtr hook, uint eventType, IntPtr window, int objectId,
+            int childId, uint eventThread, uint eventTime)
+        {
+            if (synchronizingWindows || splitter.IsDragging || objectId != Native.OBJID_WINDOW ||
+                (window != leftHandle && window != rightHandle)) return;
+
+            Rectangle area = Screen.PrimaryScreen.WorkingArea;
+            Native.RECT leftRect;
+            Native.RECT rightRect;
+            if (!Native.GetWindowRect(leftHandle, out leftRect) || !Native.GetWindowRect(rightHandle, out rightRect)) return;
+
+            const int anchorTolerance = 16;
+            bool anchored = Math.Abs(leftRect.Left - area.Left) <= anchorTolerance &&
+                Math.Abs(leftRect.Top - area.Top) <= anchorTolerance &&
+                Math.Abs(leftRect.Bottom - area.Bottom) <= anchorTolerance &&
+                Math.Abs(rightRect.Right - area.Right) <= anchorTolerance &&
+                Math.Abs(rightRect.Top - area.Top) <= anchorTolerance &&
+                Math.Abs(rightRect.Bottom - area.Bottom) <= anchorTolerance;
+            if (!anchored) return;
+
+            int dividerX = window == leftHandle ? leftRect.Right : rightRect.Left;
+            SplitterBounds current = SplitterLayout.Calculate(area, settings.SplitRatio);
+            if (Math.Abs(dividerX - current.DividerX) <= 1) return;
+
+            settings.SplitRatio = SplitterLayout.ClampRatio((double)(dividerX - area.Left) / Math.Max(1, area.Width));
+            ratioDirty = true;
+            synchronizingWindows = true;
+            try { Arrange(); }
+            finally { synchronizingWindows = false; }
         }
 
         private void ResetDivider()
@@ -506,6 +647,7 @@ namespace DualDriveExplorer
         {
             timer.Stop();
             timer.Dispose();
+            if (locationChangeHook != IntPtr.Zero) Native.UnhookWinEvent(locationChangeHook);
             splitter.Dispose();
         }
     }
@@ -544,11 +686,13 @@ namespace DualDriveExplorer
 
     internal sealed class SplitterOverlay : Form
     {
-        private const int GripWidth = 8;
+        private const int GripWidth = 16;
         private readonly Action<int> moveDivider;
         private readonly Action resetDivider;
         private readonly Action saveDivider;
         private bool dragging;
+
+        internal bool IsDragging { get { return dragging; } }
 
         internal SplitterOverlay(Action<int> move, Action reset, Action save)
         {
@@ -652,12 +796,19 @@ namespace DualDriveExplorer
 
     internal static class Native
     {
+        internal delegate void WinEventDelegate(IntPtr hook, uint eventType, IntPtr window,
+            int objectId, int childId, uint eventThread, uint eventTime);
+
         internal static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         internal const uint SWP_NOZORDER = 0x0004;
         internal const uint SWP_NOACTIVATE = 0x0010;
         internal const uint SWP_SHOWWINDOW = 0x0040;
         internal const int SW_RESTORE = 9;
         internal const uint GA_ROOTOWNER = 3;
+        internal const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
+        internal const int OBJID_WINDOW = 0;
+        internal const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+        internal const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct RECT
@@ -691,6 +842,11 @@ namespace DualDriveExplorer
         internal static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
         [DllImport("user32.dll")]
         internal static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")]
+        internal static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr module,
+            WinEventDelegate callback, uint processId, uint threadId, uint flags);
+        [DllImport("user32.dll")]
+        internal static extern bool UnhookWinEvent(IntPtr hook);
     }
 
     internal sealed class OAuthToken
@@ -1182,6 +1338,12 @@ namespace DualDriveExplorer
                 data["googleDriveReady"] = googleRoots.Count > 0 || GoogleDriveLocator.IsGoogleDriveRoot(settings.GoogleDriveRoot, false);
                 data["contextFile"] = Registry.CurrentUser.OpenSubKey(@"Software\Classes\*\shell\DualDriveExplorer.CopyGoogleUrl") != null;
                 data["contextFolder"] = Registry.CurrentUser.OpenSubKey(@"Software\Classes\Directory\shell\DualDriveExplorer.CopyGoogleUrl") != null;
+                using (RegistryKey cabinet = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Explorer\CabinetState"))
+                {
+                    data["foldersOpenInSameWindow"] = cabinet == null ||
+                        !ExplorerBrowseMode.IsNewWindowMode(cabinet.GetValue("Settings") as byte[]);
+                }
                 File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(data), new UTF8Encoding(false));
             }
             catch (Exception ex)
@@ -1224,6 +1386,15 @@ namespace DualDriveExplorer
             var offset = SplitterLayout.Calculate(new Rectangle(100, 50, 1000, 700), 0.6);
             Assert(offset.DividerX == 700 && offset.LeftWidth == 600 && offset.RightWidth == 400,
                 "The divider calculation must honor work-area offsets without a center gap.", failures);
+
+            byte[] cabinetState = new byte[] { 0x0C, 0x00, 0x02, 0x00, 0x2B, 0x01, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00 };
+            Assert(ExplorerBrowseMode.IsNewWindowMode(cabinetState),
+                "The Windows Explorer new-window flag must be detected.", failures);
+            byte[] sameWindowState = ExplorerBrowseMode.WithSameWindowMode(cabinetState);
+            Assert(!ExplorerBrowseMode.IsNewWindowMode(sameWindowState) &&
+                   sameWindowState[4] == 0x0B && sameWindowState[5] == 0x01 &&
+                   cabinetState[4] == 0x2B,
+                "Only the Explorer new-window flag must be cleared without mutating the original data.", failures);
 
             var result = new Dictionary<string, object>();
             result["passed"] = failures.Count == 0;
