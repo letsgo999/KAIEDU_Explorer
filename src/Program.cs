@@ -74,6 +74,7 @@ namespace DualDriveExplorer
         public string LeftPath { get; set; }
         public string RightPath { get; set; }
         public string GoogleDriveRoot { get; set; }
+        public double SplitRatio { get; set; }
         public string ClientIdProtected { get; set; }
         public string ClientSecretProtected { get; set; }
         public string TokenProtected { get; set; }
@@ -83,6 +84,7 @@ namespace DualDriveExplorer
             GoogleDriveRoot = GoogleDriveLocator.FindBestRoot(null);
             LeftPath = GoogleDriveRoot;
             RightPath = @"C:\";
+            SplitRatio = 0.5;
         }
     }
 
@@ -107,6 +109,7 @@ namespace DualDriveExplorer
                             value.GoogleDriveRoot = GoogleDriveLocator.FindBestRoot(null);
                         if (string.IsNullOrWhiteSpace(value.LeftPath)) value.LeftPath = value.GoogleDriveRoot;
                         if (string.IsNullOrWhiteSpace(value.RightPath)) value.RightPath = @"C:\";
+                        value.SplitRatio = SplitterLayout.ClampRatio(value.SplitRatio);
                         return value;
                     }
                 }
@@ -215,15 +218,19 @@ namespace DualDriveExplorer
     {
         private readonly AppSettings settings;
         private readonly System.Windows.Forms.Timer timer;
+        private readonly SplitterOverlay splitter;
         private IntPtr leftHandle;
         private IntPtr rightHandle;
         private int arrangeRetries;
+        private int saveTick;
 
         internal ExplorerPair(AppSettings value)
         {
             settings = value;
+            settings.SplitRatio = SplitterLayout.ClampRatio(settings.SplitRatio);
+            splitter = new SplitterOverlay(SetDividerFromScreenX, ResetDivider, SaveDividerRatio);
             timer = new System.Windows.Forms.Timer();
-            timer.Interval = 2000;
+            timer.Interval = 500;
             timer.Tick += delegate
             {
                 if (arrangeRetries > 0)
@@ -231,7 +238,13 @@ namespace DualDriveExplorer
                     Arrange();
                     arrangeRetries--;
                 }
-                CaptureAndSave();
+                UpdateSplitter();
+                saveTick++;
+                if (saveTick >= 4)
+                {
+                    saveTick = 0;
+                    CaptureAndSave();
+                }
             };
         }
 
@@ -331,7 +344,8 @@ namespace DualDriveExplorer
                 Application.DoEvents();
                 Thread.Sleep(200);
                 var windows = GetExplorerWindows();
-                var created = windows.LastOrDefault(x => !before.Contains(x.Handle.ToInt64()) && x.Handle != excluded);
+                var created = windows.LastOrDefault(x => !before.Contains(x.Handle.ToInt64()) &&
+                    x.Handle != excluded && PathsEqual(x.Path, path));
                 if (created != null) return created.Handle;
             }
             var fallback = GetExplorerWindows().LastOrDefault(x => x.Handle != excluded && PathsEqual(x.Path, path));
@@ -342,17 +356,74 @@ namespace DualDriveExplorer
         private void Arrange()
         {
             Rectangle area = Screen.PrimaryScreen.WorkingArea;
-            int half = area.Width / 2;
-            if (leftHandle != IntPtr.Zero)
-            {
-                Native.ShowWindow(leftHandle, Native.SW_RESTORE);
-                Native.SetWindowPos(leftHandle, IntPtr.Zero, area.Left, area.Top, half, area.Height, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
-            }
-            if (rightHandle != IntPtr.Zero)
-            {
-                Native.ShowWindow(rightHandle, Native.SW_RESTORE);
-                Native.SetWindowPos(rightHandle, IntPtr.Zero, area.Left + half, area.Top, area.Width - half, area.Height, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
-            }
+            SplitterBounds layout = SplitterLayout.Calculate(area, settings.SplitRatio);
+            if (leftHandle != IntPtr.Zero) Native.ShowWindow(leftHandle, Native.SW_RESTORE);
+            if (rightHandle != IntPtr.Zero) Native.ShowWindow(rightHandle, Native.SW_RESTORE);
+
+            IntPtr positions = Native.BeginDeferWindowPos(2);
+            if (positions != IntPtr.Zero && leftHandle != IntPtr.Zero)
+                positions = Native.DeferWindowPos(positions, leftHandle, IntPtr.Zero,
+                    area.Left, area.Top, layout.LeftWidth, area.Height, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+            if (positions != IntPtr.Zero && rightHandle != IntPtr.Zero)
+                positions = Native.DeferWindowPos(positions, rightHandle, IntPtr.Zero,
+                    layout.DividerX, area.Top, layout.RightWidth, area.Height, Native.SWP_NOZORDER | Native.SWP_SHOWWINDOW);
+            if (positions != IntPtr.Zero) Native.EndDeferWindowPos(positions);
+            UpdateSplitter();
+        }
+
+        private void SetDividerFromScreenX(int screenX)
+        {
+            Rectangle area = Screen.PrimaryScreen.WorkingArea;
+            settings.SplitRatio = SplitterLayout.ClampRatio((double)(screenX - area.Left) / Math.Max(1, area.Width));
+            Arrange();
+        }
+
+        private void ResetDivider()
+        {
+            settings.SplitRatio = 0.5;
+            Arrange();
+            SettingsStore.Save(settings);
+        }
+
+        internal void SaveDividerRatio()
+        {
+            SettingsStore.Save(settings);
+        }
+
+        private void UpdateSplitter()
+        {
+            Rectangle area = Screen.PrimaryScreen.WorkingArea;
+            SplitterBounds layout = SplitterLayout.Calculate(area, settings.SplitRatio);
+            bool visible = ArePairedWindowsVisible(layout, area) && IsPairActive();
+            splitter.UpdateDisplay(visible, layout.DividerX, area.Top, area.Height);
+        }
+
+        private bool ArePairedWindowsVisible(SplitterBounds layout, Rectangle area)
+        {
+            if (leftHandle == IntPtr.Zero || rightHandle == IntPtr.Zero ||
+                !Native.IsWindow(leftHandle) || !Native.IsWindow(rightHandle) ||
+                !Native.IsWindowVisible(leftHandle) || !Native.IsWindowVisible(rightHandle) ||
+                Native.IsIconic(leftHandle) || Native.IsIconic(rightHandle)) return false;
+
+            Native.RECT leftRect;
+            Native.RECT rightRect;
+            if (!Native.GetWindowRect(leftHandle, out leftRect) || !Native.GetWindowRect(rightHandle, out rightRect)) return false;
+            const int tolerance = 12;
+            return Math.Abs(leftRect.Left - area.Left) <= tolerance &&
+                   Math.Abs(leftRect.Top - area.Top) <= tolerance &&
+                   Math.Abs(leftRect.Right - layout.DividerX) <= tolerance &&
+                   Math.Abs(rightRect.Left - layout.DividerX) <= tolerance &&
+                   Math.Abs(rightRect.Right - area.Right) <= tolerance &&
+                   Math.Abs(rightRect.Bottom - area.Bottom) <= tolerance;
+        }
+
+        private bool IsPairActive()
+        {
+            IntPtr foreground = Native.GetForegroundWindow();
+            if (foreground == IntPtr.Zero) return false;
+            if (foreground == leftHandle || foreground == rightHandle || foreground == splitter.Handle) return true;
+            IntPtr owner = Native.GetAncestor(foreground, Native.GA_ROOTOWNER);
+            return owner == leftHandle || owner == rightHandle;
         }
 
         internal void CaptureAndSave()
@@ -431,7 +502,145 @@ namespace DualDriveExplorer
             return null;
         }
 
-        public void Dispose() { timer.Stop(); timer.Dispose(); }
+        public void Dispose()
+        {
+            timer.Stop();
+            timer.Dispose();
+            splitter.Dispose();
+        }
+    }
+
+    internal struct SplitterBounds
+    {
+        internal int DividerX;
+        internal int LeftWidth;
+        internal int RightWidth;
+    }
+
+    internal static class SplitterLayout
+    {
+        internal const double MinimumRatio = 0.30;
+        internal const double MaximumRatio = 0.70;
+
+        internal static double ClampRatio(double ratio)
+        {
+            if (double.IsNaN(ratio) || double.IsInfinity(ratio) || ratio <= 0) return 0.5;
+            return Math.Max(MinimumRatio, Math.Min(MaximumRatio, ratio));
+        }
+
+        internal static SplitterBounds Calculate(Rectangle area, double ratio)
+        {
+            double safeRatio = ClampRatio(ratio);
+            int leftWidth = (int)Math.Round(area.Width * safeRatio, MidpointRounding.AwayFromZero);
+            leftWidth = Math.Max(1, Math.Min(area.Width - 1, leftWidth));
+            return new SplitterBounds
+            {
+                DividerX = area.Left + leftWidth,
+                LeftWidth = leftWidth,
+                RightWidth = area.Width - leftWidth
+            };
+        }
+    }
+
+    internal sealed class SplitterOverlay : Form
+    {
+        private const int GripWidth = 8;
+        private readonly Action<int> moveDivider;
+        private readonly Action resetDivider;
+        private readonly Action saveDivider;
+        private bool dragging;
+
+        internal SplitterOverlay(Action<int> move, Action reset, Action save)
+        {
+            moveDivider = move;
+            resetDivider = reset;
+            saveDivider = save;
+            Text = "KAIEDU Explorer Divider";
+            AccessibleName = "KAIEDU Explorer resize divider";
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Color.FromArgb(232, 236, 241);
+            Cursor = Cursors.VSplit;
+            Width = GripWidth;
+            DoubleBuffered = true;
+            MouseDown += OnGripMouseDown;
+            MouseMove += OnGripMouseMove;
+            MouseUp += OnGripMouseUp;
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                const int WS_EX_TOOLWINDOW = 0x00000080;
+                const int WS_EX_NOACTIVATE = 0x08000000;
+                CreateParams parameters = base.CreateParams;
+                parameters.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+                return parameters;
+            }
+        }
+
+        internal void UpdateDisplay(bool shouldShow, int dividerX, int top, int height)
+        {
+            if (!shouldShow && !dragging)
+            {
+                if (Visible) Hide();
+                return;
+            }
+            SetBounds(dividerX - GripWidth / 2, top, GripWidth, height);
+            if (!Visible) Show();
+            Native.SetWindowPos(Handle, Native.HWND_TOPMOST, Left, Top, Width, Height,
+                Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            int center = Width / 2;
+            using (var line = new Pen(Color.FromArgb(118, 126, 138)))
+                e.Graphics.DrawLine(line, center, 0, center, Height);
+
+            int handleY = Math.Max(12, Height / 2 - 22);
+            using (var brush = new SolidBrush(Color.FromArgb(76, 84, 96)))
+            using (var font = new Font("Segoe UI Symbol", 11f, FontStyle.Bold, GraphicsUnit.Point))
+            {
+                var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+                e.Graphics.DrawString("↔", font, brush, new RectangleF(0, handleY, Width, 44), format);
+            }
+        }
+
+        private void OnGripMouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            if (e.Clicks >= 2)
+            {
+                dragging = false;
+                Capture = false;
+                resetDivider();
+                return;
+            }
+            dragging = true;
+            Capture = true;
+            moveDivider(Control.MousePosition.X);
+        }
+
+        private void OnGripMouseMove(object sender, MouseEventArgs e)
+        {
+            if (dragging) moveDivider(Control.MousePosition.X);
+        }
+
+        private void OnGripMouseUp(object sender, MouseEventArgs e)
+        {
+            if (!dragging) return;
+            dragging = false;
+            Capture = false;
+            saveDivider();
+        }
     }
 
     internal sealed class ExplorerWindow
@@ -443,13 +652,45 @@ namespace DualDriveExplorer
 
     internal static class Native
     {
+        internal static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         internal const uint SWP_NOZORDER = 0x0004;
+        internal const uint SWP_NOACTIVATE = 0x0010;
         internal const uint SWP_SHOWWINDOW = 0x0040;
         internal const int SW_RESTORE = 9;
+        internal const uint GA_ROOTOWNER = 3;
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct RECT
+        {
+            internal int Left;
+            internal int Top;
+            internal int Right;
+            internal int Bottom;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr BeginDeferWindowPos(int numberOfWindows);
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr DeferWindowPos(IntPtr positionInfo, IntPtr hWnd, IntPtr hWndInsertAfter,
+            int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern bool EndDeferWindowPos(IntPtr positionInfo);
         [DllImport("user32.dll")]
         internal static extern bool ShowWindow(IntPtr hWnd, int command);
+        [DllImport("user32.dll")]
+        internal static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        internal static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        internal static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+        [DllImport("user32.dll")]
+        internal static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     }
 
     internal sealed class OAuthToken
@@ -933,6 +1174,7 @@ namespace DualDriveExplorer
                 data["settingsPath"] = SettingsStore.SettingsPath;
                 data["leftPath"] = settings.LeftPath;
                 data["rightPath"] = settings.RightPath;
+                data["splitRatio"] = settings.SplitRatio;
                 data["googleConfigured"] = GoogleAuth.IsConfigured(settings);
                 var googleRoots = GoogleDriveLocator.FindRoots();
                 data["googleDriveRoots"] = googleRoots;
@@ -972,6 +1214,16 @@ namespace DualDriveExplorer
                 "A file below the detected root must be recognized.", failures);
             Assert(!GoogleDriveLocator.IsPathInside(@"G:\local.txt", @"H:\"),
                 "A local G: path must not be treated as an H: Google Drive path.", failures);
+
+            var equal = SplitterLayout.Calculate(new Rectangle(0, 0, 1858, 1080), 0.5);
+            Assert(equal.LeftWidth == 929 && equal.RightWidth == 929 && equal.DividerX == 929,
+                "A 1858-pixel work area must split into two adjacent 929-pixel windows.", failures);
+            Assert(Math.Abs(SplitterLayout.ClampRatio(0.1) - 0.30) < 0.0001 &&
+                   Math.Abs(SplitterLayout.ClampRatio(0.9) - 0.70) < 0.0001,
+                "The draggable divider must stay between 30% and 70%.", failures);
+            var offset = SplitterLayout.Calculate(new Rectangle(100, 50, 1000, 700), 0.6);
+            Assert(offset.DividerX == 700 && offset.LeftWidth == 600 && offset.RightWidth == 400,
+                "The divider calculation must honor work-area offsets without a center gap.", failures);
 
             var result = new Dictionary<string, object>();
             result["passed"] = failures.Count == 0;
