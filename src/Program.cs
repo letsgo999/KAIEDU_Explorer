@@ -45,6 +45,18 @@ namespace DualDriveExplorer
                 return;
             }
 
+            if (args.Length >= 2 && string.Equals(args[0], "--self-test", StringComparison.OrdinalIgnoreCase))
+            {
+                SelfTests.Write(args[1]);
+                return;
+            }
+
+            if (args.Length >= 3 && string.Equals(args[0], "--resolve-url", StringComparison.OrdinalIgnoreCase))
+            {
+                UrlCommand.WriteResolvedUrl(args[1], args[2]);
+                return;
+            }
+
             bool created;
             using (var mutex = new Mutex(true, "Local\\DualDriveExplorer.Controller", out created))
             {
@@ -61,13 +73,15 @@ namespace DualDriveExplorer
     {
         public string LeftPath { get; set; }
         public string RightPath { get; set; }
+        public string GoogleDriveRoot { get; set; }
         public string ClientIdProtected { get; set; }
         public string ClientSecretProtected { get; set; }
         public string TokenProtected { get; set; }
 
         public AppSettings()
         {
-            LeftPath = @"G:\";
+            GoogleDriveRoot = GoogleDriveLocator.FindBestRoot(null);
+            LeftPath = GoogleDriveRoot;
             RightPath = @"C:\";
         }
     }
@@ -89,7 +103,9 @@ namespace DualDriveExplorer
                     var value = Json.Deserialize<AppSettings>(File.ReadAllText(SettingsPath, Encoding.UTF8));
                     if (value != null)
                     {
-                        if (string.IsNullOrWhiteSpace(value.LeftPath)) value.LeftPath = @"G:\";
+                        if (string.IsNullOrWhiteSpace(value.GoogleDriveRoot))
+                            value.GoogleDriveRoot = GoogleDriveLocator.FindBestRoot(null);
+                        if (string.IsNullOrWhiteSpace(value.LeftPath)) value.LeftPath = value.GoogleDriveRoot;
                         if (string.IsNullOrWhiteSpace(value.RightPath)) value.RightPath = @"C:\";
                         return value;
                     }
@@ -142,9 +158,11 @@ namespace DualDriveExplorer
             var menu = new ContextMenuStrip();
             menu.Items.Add(MenuItem("Open / arrange explorers", delegate { explorerPair.OpenAndArrange(); }));
             menu.Items.Add(MenuItem("Save current paths", delegate { explorerPair.CaptureAndSave(); ShowBalloon("Paths saved."); }));
+            menu.Items.Add(MenuItem("Select Google Drive location...", delegate { explorerPair.SelectGoogleDriveRoot(); }));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(MenuItem("Connect Google account...", delegate { GoogleAuth.ConnectInteractive(); }));
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(MenuItem("Privacy policy", delegate { OpenWebPage("https://kaiedu.center/download/privacy"); }));
             menu.Items.Add(MenuItem("Exit", delegate { ExitApp(); }));
 
             tray = new NotifyIcon();
@@ -163,6 +181,11 @@ namespace DualDriveExplorer
             var item = new ToolStripMenuItem(text);
             item.Click += action;
             return item;
+        }
+
+        private static void OpenWebPage(string url)
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
         }
 
         private void FirstIdle(object sender, EventArgs e)
@@ -216,13 +239,77 @@ namespace DualDriveExplorer
 
         internal void OpenAndArrange()
         {
-            string left = ExistingOrDefault(settings.LeftPath, @"G:\");
+            string googleRoot = ResolveGoogleDriveRoot(true);
+            if (string.IsNullOrEmpty(googleRoot)) return;
+
+            string left = GoogleDriveLocator.IsPathInside(settings.LeftPath, googleRoot) && Directory.Exists(settings.LeftPath)
+                ? settings.LeftPath
+                : googleRoot;
             string right = ExistingOrDefault(settings.RightPath, @"C:\");
             leftHandle = OpenExplorerWindow(left, IntPtr.Zero);
             rightHandle = OpenExplorerWindow(right, leftHandle);
             arrangeRetries = 5;
             Arrange();
             CaptureAndSave();
+        }
+
+        internal void SelectGoogleDriveRoot()
+        {
+            using (var dialog = new FolderBrowserDialog())
+            {
+                dialog.Description = "Select the Google Drive streaming location (the folder that contains My Drive).";
+                dialog.RootFolder = Environment.SpecialFolder.MyComputer;
+                if (!string.IsNullOrWhiteSpace(settings.GoogleDriveRoot) && Directory.Exists(settings.GoogleDriveRoot))
+                    dialog.SelectedPath = settings.GoogleDriveRoot;
+                if (dialog.ShowDialog() != DialogResult.OK) return;
+                string selected = GoogleDriveLocator.NormalizeRoot(dialog.SelectedPath);
+                if (!GoogleDriveLocator.IsGoogleDriveRoot(selected, false))
+                {
+                    MessageBox.Show(
+                        "The selected location is not a recognized Google Drive for desktop streaming location. Select the folder or drive that contains My Drive.",
+                        "KAIEDU Explorer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                ApplyGoogleDriveRoot(selected);
+                SettingsStore.Save(settings);
+                OpenAndArrange();
+            }
+        }
+
+        private string ResolveGoogleDriveRoot(bool showMessage)
+        {
+            string detected = GoogleDriveLocator.FindBestRoot(settings.GoogleDriveRoot);
+            if (string.IsNullOrEmpty(detected))
+            {
+                if (showMessage)
+                {
+                    MessageBox.Show(
+                        "Google Drive for desktop is not ready. Install or start Google Drive, sign in, and then choose 'Open / arrange explorers'. If Drive is streamed to a folder, use 'Select Google Drive location...'.",
+                        "KAIEDU Explorer", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                return null;
+            }
+            ApplyGoogleDriveRoot(detected);
+            return detected;
+        }
+
+        private void ApplyGoogleDriveRoot(string newRoot)
+        {
+            string oldRoot = settings.GoogleDriveRoot;
+            if (!string.IsNullOrWhiteSpace(oldRoot) &&
+                !string.Equals(GoogleDriveLocator.NormalizeRoot(oldRoot), newRoot, StringComparison.OrdinalIgnoreCase) &&
+                GoogleDriveLocator.IsPathInside(settings.LeftPath, oldRoot))
+            {
+                string relative = settings.LeftPath.Substring(GoogleDriveLocator.NormalizeRoot(oldRoot).Length).TrimStart('\\');
+                string rebased = Path.Combine(newRoot, relative);
+                settings.LeftPath = Directory.Exists(rebased) ? rebased : newRoot;
+            }
+            else if (!GoogleDriveLocator.IsPathInside(settings.LeftPath, newRoot) || !Directory.Exists(settings.LeftPath))
+            {
+                settings.LeftPath = newRoot;
+            }
+            settings.GoogleDriveRoot = newRoot;
+            SettingsStore.Save(settings);
         }
 
         private static string ExistingOrDefault(string requested, string fallback)
@@ -274,7 +361,9 @@ namespace DualDriveExplorer
             var windows = GetExplorerWindows();
             var left = windows.FirstOrDefault(x => x.Handle == leftHandle);
             var right = windows.FirstOrDefault(x => x.Handle == rightHandle);
-            if (left != null && Directory.Exists(left.Path) && !PathsEqual(left.Path, settings.LeftPath))
+            if (left != null && Directory.Exists(left.Path) &&
+                GoogleDriveLocator.IsPathInside(left.Path, settings.GoogleDriveRoot) &&
+                !PathsEqual(left.Path, settings.LeftPath))
             {
                 settings.LeftPath = left.Path;
                 changed = true;
@@ -534,17 +623,133 @@ namespace DualDriveExplorer
         public DriveItem[] files { get; set; }
     }
 
+    internal sealed class GoogleDriveCandidate
+    {
+        internal string RootPath { get; set; }
+        internal string VolumeLabel { get; set; }
+        internal bool IsReady { get; set; }
+        internal bool HasMyDrive { get; set; }
+        internal bool HasDriveMarker { get; set; }
+    }
+
+    internal static class GoogleDriveLocator
+    {
+        private static readonly string[] MyDriveLabels = { "My Drive", "\uB0B4 \uB4DC\uB77C\uC774\uBE0C" };
+
+        internal static string NormalizeRoot(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            try
+            {
+                string full = Path.GetFullPath(path).TrimEnd('\\');
+                return full.Length == 2 && full[1] == ':' ? full + "\\" : full;
+            }
+            catch { return null; }
+        }
+
+        internal static bool IsPathInside(string path, string root)
+        {
+            string fullPath = NormalizeRoot(path);
+            string fullRoot = NormalizeRoot(root);
+            if (fullPath == null || fullRoot == null) return false;
+            if (string.Equals(fullPath, fullRoot, StringComparison.OrdinalIgnoreCase)) return true;
+            string prefix = fullRoot.TrimEnd('\\') + "\\";
+            return fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool IsCandidateShape(GoogleDriveCandidate candidate, bool requireVolumeLabel)
+        {
+            if (candidate == null || !candidate.IsReady || !candidate.HasMyDrive || !candidate.HasDriveMarker) return false;
+            return !requireVolumeLabel || string.Equals(candidate.VolumeLabel, "Google Drive", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool IsGoogleDriveRoot(string root, bool requireVolumeLabel)
+        {
+            string normalized = NormalizeRoot(root);
+            if (normalized == null || !Directory.Exists(normalized)) return false;
+            var candidate = ReadCandidate(normalized);
+            if (requireVolumeLabel)
+            {
+                try { candidate.VolumeLabel = new DriveInfo(Path.GetPathRoot(normalized)).VolumeLabel; }
+                catch { candidate.VolumeLabel = null; }
+            }
+            return IsCandidateShape(candidate, requireVolumeLabel);
+        }
+
+        internal static List<string> FindRoots()
+        {
+            var result = new List<string>();
+            foreach (DriveInfo drive in DriveInfo.GetDrives())
+            {
+                try
+                {
+                    if (!drive.IsReady) continue;
+                    var candidate = ReadCandidate(drive.RootDirectory.FullName);
+                    candidate.VolumeLabel = drive.VolumeLabel;
+                    if (IsCandidateShape(candidate, true)) result.Add(NormalizeRoot(candidate.RootPath));
+                }
+                catch { }
+            }
+            return result.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        internal static string SelectBestRoot(IEnumerable<string> roots, string preferredRoot)
+        {
+            var normalized = roots.Select(NormalizeRoot).Where(x => x != null).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            string preferred = NormalizeRoot(preferredRoot);
+            if (preferred != null)
+            {
+                string match = normalized.FirstOrDefault(x => string.Equals(x, preferred, StringComparison.OrdinalIgnoreCase));
+                if (match != null) return match;
+            }
+            return normalized.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
+        }
+
+        internal static string FindBestRoot(string preferredRoot)
+        {
+            var roots = FindRoots();
+            string preferred = NormalizeRoot(preferredRoot);
+            if (preferred != null && IsGoogleDriveRoot(preferred, false) && !roots.Contains(preferred, StringComparer.OrdinalIgnoreCase))
+                roots.Add(preferred);
+            return SelectBestRoot(roots, preferred);
+        }
+
+        internal static string FindRootForPath(string path, string preferredRoot)
+        {
+            var roots = FindRoots();
+            string preferred = NormalizeRoot(preferredRoot);
+            if (preferred != null && IsGoogleDriveRoot(preferred, false) && !roots.Contains(preferred, StringComparer.OrdinalIgnoreCase))
+                roots.Add(preferred);
+            return roots.Where(root => IsPathInside(path, root)).OrderByDescending(root => root.Length).FirstOrDefault();
+        }
+
+        private static GoogleDriveCandidate ReadCandidate(string root)
+        {
+            string normalized = NormalizeRoot(root);
+            bool hasMyDrive = MyDriveLabels.Any(label => Directory.Exists(Path.Combine(normalized, label)));
+            bool hasMarker = Directory.Exists(Path.Combine(normalized, ".shortcut-targets-by-id")) ||
+                             Directory.Exists(Path.Combine(normalized, ".Encrypted"));
+            return new GoogleDriveCandidate
+            {
+                RootPath = normalized,
+                IsReady = normalized != null && Directory.Exists(normalized),
+                HasMyDrive = hasMyDrive,
+                HasDriveMarker = hasMarker
+            };
+        }
+    }
+
     internal static class DriveResolver
     {
         private const string FolderMime = "application/vnd.google-apps.folder";
         private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
 
-        internal static DriveItem Resolve(string localPath, string accessToken)
+        internal static DriveItem Resolve(string localPath, string accessToken, string configuredRoot)
         {
             string full = Path.GetFullPath(localPath).TrimEnd('\\');
-            string root = Path.GetPathRoot(full);
-            if (!string.Equals(root, @"G:\", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("The selected item is not inside the Google Drive G: volume.");
+            string root = GoogleDriveLocator.FindRootForPath(full, configuredRoot);
+            if (string.IsNullOrEmpty(root))
+                throw new InvalidOperationException("The selected item is not inside a recognized Google Drive for desktop location.");
 
             string relative = full.Substring(root.Length).Trim('\\');
             if (relative.Length == 0)
@@ -567,7 +772,7 @@ namespace DualDriveExplorer
             }
             else
             {
-                throw new InvalidOperationException("Only My Drive and Shared drives under G: are supported.");
+                throw new InvalidOperationException("Only My Drive and Shared drives under the selected Google Drive location are supported.");
             }
 
             DriveItem current = null;
@@ -666,31 +871,54 @@ namespace DualDriveExplorer
         {
             try
             {
-                if (!File.Exists(path) && !Directory.Exists(path))
-                    throw new FileNotFoundException("The selected item no longer exists.");
-                var settings = SettingsStore.Load();
-                if (!GoogleAuth.IsConfigured(settings))
-                    throw new InvalidOperationException("Google OAuth is not connected. Open Dual Drive Explorer from the tray and choose 'Connect Google account...'.");
-                string token = GoogleAuth.GetAccessToken(settings);
-                if (string.IsNullOrEmpty(token))
-                    throw new InvalidOperationException("Google authorization expired. Reconnect the Google account from the tray menu.");
-
-                DriveItem item = null;
-                for (int attempt = 0; attempt < 6 && item == null; attempt++)
-                {
-                    item = DriveResolver.Resolve(path, token);
-                    if (item == null) Thread.Sleep(2000);
-                }
-                if (item == null || string.IsNullOrEmpty(item.webViewLink))
-                    throw new InvalidOperationException("The item is not available in Google Drive yet. It may still be syncing.");
-
-                Clipboard.SetText(item.webViewLink);
+                Clipboard.SetText(ResolveUrl(path));
                 MessageBox.Show("Google Drive URL copied to the clipboard.", "Dual Drive Explorer", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
                 MessageBox.Show(ex.Message, "Copy Google Cloud URL", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+        }
+
+        internal static void WriteResolvedUrl(string path, string outputPath)
+        {
+            try
+            {
+                File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(new Dictionary<string, object>
+                {
+                    { "success", true }, { "url", ResolveUrl(path) }
+                }), new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(new Dictionary<string, object>
+                {
+                    { "success", false }, { "error", ex.Message }
+                }), new UTF8Encoding(false));
+                Environment.ExitCode = 1;
+            }
+        }
+
+        private static string ResolveUrl(string path)
+        {
+            if (!File.Exists(path) && !Directory.Exists(path))
+                throw new FileNotFoundException("The selected item no longer exists.");
+            var settings = SettingsStore.Load();
+            if (!GoogleAuth.IsConfigured(settings))
+                throw new InvalidOperationException("Google OAuth is not connected. Open Dual Drive Explorer from the tray and choose 'Connect Google account...'.");
+            string token = GoogleAuth.GetAccessToken(settings);
+            if (string.IsNullOrEmpty(token))
+                throw new InvalidOperationException("Google authorization expired. Reconnect the Google account from the tray menu.");
+
+            DriveItem item = null;
+            for (int attempt = 0; attempt < 6 && item == null; attempt++)
+            {
+                item = DriveResolver.Resolve(path, token, settings.GoogleDriveRoot);
+                if (item == null) Thread.Sleep(2000);
+            }
+            if (item == null || string.IsNullOrEmpty(item.webViewLink))
+                throw new InvalidOperationException("The item is not available in Google Drive yet. It may still be syncing.");
+            return item.webViewLink;
         }
     }
 
@@ -706,7 +934,10 @@ namespace DualDriveExplorer
                 data["leftPath"] = settings.LeftPath;
                 data["rightPath"] = settings.RightPath;
                 data["googleConfigured"] = GoogleAuth.IsConfigured(settings);
-                data["gDriveReady"] = Directory.Exists(@"G:\");
+                var googleRoots = GoogleDriveLocator.FindRoots();
+                data["googleDriveRoots"] = googleRoots;
+                data["googleDriveRoot"] = GoogleDriveLocator.SelectBestRoot(googleRoots, settings.GoogleDriveRoot);
+                data["googleDriveReady"] = googleRoots.Count > 0 || GoogleDriveLocator.IsGoogleDriveRoot(settings.GoogleDriveRoot, false);
                 data["contextFile"] = Registry.CurrentUser.OpenSubKey(@"Software\Classes\*\shell\DualDriveExplorer.CopyGoogleUrl") != null;
                 data["contextFolder"] = Registry.CurrentUser.OpenSubKey(@"Software\Classes\Directory\shell\DualDriveExplorer.CopyGoogleUrl") != null;
                 File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(data), new UTF8Encoding(false));
@@ -715,6 +946,44 @@ namespace DualDriveExplorer
             {
                 File.WriteAllText(outputPath, "{\"error\":\"" + ex.Message.Replace("\"", "'") + "\"}");
             }
+        }
+    }
+
+    internal static class SelfTests
+    {
+        internal static void Write(string outputPath)
+        {
+            var failures = new List<string>();
+            Assert(!GoogleDriveLocator.IsCandidateShape(new GoogleDriveCandidate
+            {
+                RootPath = @"G:\", VolumeLabel = "DATA", IsReady = true, HasMyDrive = true, HasDriveMarker = true
+            }, true), "A local G: volume must not be accepted merely because it has Drive-like folders.", failures);
+            Assert(GoogleDriveLocator.IsCandidateShape(new GoogleDriveCandidate
+            {
+                RootPath = @"H:\", VolumeLabel = "Google Drive", IsReady = true, HasMyDrive = true, HasDriveMarker = true
+            }, true), "A valid Google Drive volume on H: must be accepted.", failures);
+            Assert(string.Equals(GoogleDriveLocator.SelectBestRoot(new[] { @"H:\" }, @"G:\"), @"H:\", StringComparison.OrdinalIgnoreCase),
+                "When local G: conflicts, the detected H: Google Drive must be selected.", failures);
+            Assert(string.Equals(GoogleDriveLocator.SelectBestRoot(new[] { @"H:\", @"I:\" }, @"I:\"), @"I:\", StringComparison.OrdinalIgnoreCase),
+                "The saved preferred Google Drive must win when multiple roots exist.", failures);
+            Assert(GoogleDriveLocator.SelectBestRoot(new string[0], null) == null,
+                "No Google Drive installation must produce no selected root.", failures);
+            Assert(GoogleDriveLocator.IsPathInside(@"H:\My Drive\file.txt", @"H:\"),
+                "A file below the detected root must be recognized.", failures);
+            Assert(!GoogleDriveLocator.IsPathInside(@"G:\local.txt", @"H:\"),
+                "A local G: path must not be treated as an H: Google Drive path.", failures);
+
+            var result = new Dictionary<string, object>();
+            result["passed"] = failures.Count == 0;
+            result["failureCount"] = failures.Count;
+            result["failures"] = failures;
+            File.WriteAllText(outputPath, new JavaScriptSerializer().Serialize(result), new UTF8Encoding(false));
+            if (failures.Count > 0) Environment.ExitCode = 1;
+        }
+
+        private static void Assert(bool condition, string message, List<string> failures)
+        {
+            if (!condition) failures.Add(message);
         }
     }
 }
