@@ -51,7 +51,7 @@ internal static class SetupLauncher
                 {
                     if (!quiet)
                         MessageBox.Show(
-                            "설치가 완료되었습니다.\r\n\r\n폴더가 현재 탐색기 창 안에서 열리도록 Windows 탐색기 옵션도 조정했습니다.\r\n작업표시줄 알림 영역에서 KAIEDU Explorer를 확인해 주세요.",
+                            "설치가 완료되었습니다.\r\n\r\nKAIEDU Explorer는 Windows 시작 시 자동 실행되지 않습니다.\r\nGoogle Drive가 준비된 뒤 시작 메뉴에서 필요할 때 실행해 주세요.",
                             "KAIEDU Explorer 설치", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return 0;
                 }

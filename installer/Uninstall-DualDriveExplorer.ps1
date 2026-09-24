@@ -15,6 +15,8 @@ foreach ($target in @(
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Dual Drive Explorer.lnk'
 Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+$startMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'KAIEDU Explorer.lnk'
+Remove-Item -LiteralPath $startMenuShortcut -Force -ErrorAction SilentlyContinue
 
 $localRoot = [IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') + '\'
 if ($installDir.StartsWith($localRoot, [StringComparison]::OrdinalIgnoreCase) -and

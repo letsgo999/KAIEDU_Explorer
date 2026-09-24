@@ -13,8 +13,11 @@ Google Drive URL 복사 기능에는 Windows 10/11용 **Google Drive 데스크�
 1. 최신 ZIP을 내려받아 압축을 풉니다.
 2. 압축을 푼 최상위 폴더의 `KAIEDU-Explorer-Setup.exe`를 더블클릭합니다.
 3. **설치가 완료되었습니다** 안내창을 확인합니다. 관리자 권한은 필요하지 않습니다.
-4. 알림 영역의 앱 아이콘을 우클릭하고 **Connect Google account...**를 선택합니다.
-5. 본인의 Google OAuth 데스크톱 클라이언트 JSON을 선택한 뒤 브라우저에서 권한을 허용합니다.
+4. Google Drive가 준비된 뒤 Windows 시작 메뉴에서 **KAIEDU Explorer**를 실행합니다.
+5. 알림 영역의 앱 아이콘을 우클릭하고 **Connect Google account...**를 선택합니다.
+6. 본인의 Google OAuth 데스크톱 클라이언트 JSON을 선택한 뒤 브라우저에서 권한을 허용합니다.
+
+KAIEDU Explorer는 Windows 부팅이나 재부팅 시 자동 실행되지 않습니다. Google Drive와 Hermes 자동 시작 과정에도 포함되지 않으며, 파일 작업이 필요할 때 직접 실행하는 선택형 프로그램입니다.
 
 설치 EXE는 아직 상용 코드 서명이 없어 Windows에서 ‘알 수 없는 게시자’ 경고가 나타날 수 있습니다. 반드시 공식 GitHub 릴리스에서 내려받은 파일인지 확인하세요.
 

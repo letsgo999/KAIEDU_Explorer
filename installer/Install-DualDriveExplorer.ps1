@@ -43,8 +43,11 @@ foreach ($target in $targets) {
     $menuKey.Dispose()
 }
 
-$startup = [Environment]::GetFolderPath('Startup')
-$shortcutPath = Join-Path $startup 'Dual Drive Explorer.lnk'
+$startupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) 'Dual Drive Explorer.lnk'
+Remove-Item -LiteralPath $startupShortcut -Force -ErrorAction SilentlyContinue
+
+$programs = [Environment]::GetFolderPath('Programs')
+$shortcutPath = Join-Path $programs 'KAIEDU Explorer.lnk'
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $powerShellExe
@@ -64,5 +67,6 @@ Start-Process -FilePath $powerShellExe -ArgumentList @(
 )
 Write-Output "Installed: $installScript"
 Write-Output "Context menu: $menuText"
-Write-Output "Startup shortcut: $shortcutPath"
+Write-Output "Start menu shortcut: $shortcutPath"
+Write-Output "Automatic startup: disabled"
 Write-Output "Explorer browse mode: folders open in the same window"

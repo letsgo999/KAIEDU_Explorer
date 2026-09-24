@@ -22,8 +22,11 @@ Google Drive URL 복사 기능을 사용하려면 **Google Drive 데스크톱 �
 
 1. 최신 릴리스 ZIP 전체를 한 폴더에 압축 해제합니다.
 2. 루트의 `KAIEDU-Explorer-Setup.exe`를 더블클릭합니다.
-3. 작업 표시줄 알림 영역의 아이콘을 우클릭해 **Connect Google account...**를 선택합니다.
-4. 본인이 만든 Google OAuth 2.0 **Desktop app** 클라이언트 JSON을 선택합니다.
+3. Google Drive가 준비된 뒤 Windows 시작 메뉴에서 **KAIEDU Explorer**를 실행합니다.
+4. 작업 표시줄 알림 영역의 아이콘을 우클릭해 **Connect Google account...**를 선택합니다.
+5. 본인이 만든 Google OAuth 2.0 **Desktop app** 클라이언트 JSON을 선택합니다.
+
+KAIEDU Explorer는 Windows 부팅 시 자동 실행되지 않는 선택형 도구입니다. Google Drive 및 Hermes의 자동 시작 순서와 분리되어 있으며, 필요할 때 사용자가 직접 실행합니다.
 
 Google Drive가 폴더 위치로 스트리밍되거나 여러 위치가 감지되면 트레이 메뉴의 **Select Google Drive location...**에서 `My Drive` 또는 `내 드라이브`가 들어 있는 위치를 선택합니다.
 
